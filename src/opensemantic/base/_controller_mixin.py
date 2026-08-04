@@ -12,7 +12,7 @@ import logging
 from abc import abstractmethod
 from datetime import datetime
 from enum import Enum
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from oold.model import BaseController
 from pydantic import BaseModel, ConfigDict
@@ -62,12 +62,7 @@ class DataToolMixin(BaseController):
     def __init__(self, *args, **data):
         super().__init__(*args, **data)
         self._compute_subobject_ids()
-        if not isinstance(getattr(self, "_channel_dict", None), dict):
-            object.__setattr__(self, "_channel_dict", {})
-        for channel in self.get_all_channels():
-            # Use node_id if available (OPC UA), fall back to uuid
-            key = getattr(channel, "node_id", None) or channel.uuid
-            self._channel_dict[key] = channel
+        self.rebuild_channel_dict()
         # Warn about unloaded channel characteristics
         self._check_channel_characteristics()
         # TODO: update wiki OpcUaServer model to include endpoint/url field
@@ -83,6 +78,21 @@ class DataToolMixin(BaseController):
     # __setattr__ for private attrs inherited from BaseController
     # get_osw_id() and get_iri() are inherited from OswBaseModel
     # via the model base class (DataTool -> Entity -> OswBaseModel)
+
+    def rebuild_channel_dict(self):
+        """Index all channels of self and its subdevices for fast lookup.
+
+        Called from __init__. Call it again after mutating data_channels or
+        subdevices, otherwise incoming notifications for the new channels are
+        not routed.
+        """
+        if not isinstance(getattr(self, "_channel_dict", None), dict):
+            object.__setattr__(self, "_channel_dict", {})
+        self._channel_dict.clear()
+        for channel in self.get_all_channels():
+            # Use node_id if available (OPC UA), fall back to uuid
+            key = getattr(channel, "node_id", None) or channel.uuid
+            self._channel_dict[key] = channel
 
     # TODO: Consider moving _compute_subobject_ids to OswBaseModel
     def _compute_subobject_ids(self, parent_chain=None):
@@ -336,6 +346,123 @@ class DataToolMixin(BaseController):
                 "(aiosqlite or postgrest)"
             )
             return None
+
+    # -- Component hierarchy --
+
+    @staticmethod
+    def _component_refs(entity) -> list:
+        """Return (component_type_iri, component_instance) pairs of a tool.
+
+        The IRIs are read from ``__iris__`` instead of the attributes so the
+        lazy backend resolution of ``component_instance`` is not triggered.
+        Resolving it would load the child with autofetch_schema=True and
+        generate an ad-hoc model instead of using the installed package.
+        """
+
+        def _first(value):
+            if isinstance(value, list):
+                return value[0] if value else None
+            return value
+
+        refs = []
+        for comp in getattr(entity, "components", None) or []:
+            iris = getattr(comp, "__iris__", None) or {}
+            instance = _first(iris.get("component_instance"))
+            if instance is None:
+                # Inline object instead of a reference
+                instance = comp.__dict__.get("component_instance")
+            if instance is None:
+                continue
+            refs.append((_first(iris.get("component_type")), instance))
+        return refs
+
+    @classmethod
+    def load_from_osw(
+        cls,
+        osw,
+        iri: str,
+        model_by_component_type: Optional[Dict[str, type]] = None,
+        default_model: Optional[type] = None,
+        depth: int = -1,
+        **kwargs,
+    ):
+        """Load a tool and its component hierarchy from the OSW backend.
+
+        ``components`` is the OSW backend's parent/child relation for tools.
+        The controller-only ``subdevices`` list is populated from it, so
+        get_all_channels(), get_channel_owner() and archiving work on the
+        whole hierarchy.
+
+        Parameters
+        ----------
+        osw
+            An ``osw.core.OSW`` instance. Only ``load_entity`` and its
+            ``LoadEntityParam`` are used, so osw stays an optional dependency.
+        iri
+            IRI of the root tool, e.g. ``Item:OSW<uuid without dashes>``.
+        model_by_component_type
+            Maps a component type IRI to the class the child is loaded as.
+            Use it when the children are not all of the same kind. The classes
+            have to be controllers (composing this mixin), otherwise the tree
+            traversal in get_subdevices() / get_all_channels() fails.
+        default_model
+            Controller class for children without a mapping. Defaults to
+            ``cls``.
+        depth
+            Component levels to follow, -1 for unlimited, 0 for the root only.
+        kwargs
+            Extra attributes to set on the root, e.g. ``url=...``.
+        """
+        return cls._load_tree(
+            osw=osw,
+            iri=iri,
+            model=cls,
+            mapping=model_by_component_type or {},
+            default_model=default_model or cls,
+            depth=depth,
+            extra=kwargs,
+        )
+
+    @classmethod
+    def _load_tree(cls, osw, iri, model, mapping, default_model, depth, extra):
+        param = type(osw).LoadEntityParam(
+            titles=iri, autofetch_schema=False, model_to_use=model
+        )
+        entity = osw.load_entity(param).entities[0]
+        for key, value in (extra or {}).items():
+            setattr(entity, key, value)
+
+        if depth == 0:
+            return entity
+
+        subdevices = []
+        for component_type, ref in cls._component_refs(entity):
+            child_model = mapping.get(component_type, default_model)
+            if isinstance(ref, str):
+                subdevices.append(
+                    cls._load_tree(
+                        osw=osw,
+                        iri=ref,
+                        model=child_model,
+                        mapping=mapping,
+                        default_model=default_model,
+                        depth=depth - 1,
+                        extra={},
+                    )
+                )
+            elif isinstance(ref, child_model):
+                subdevices.append(ref)
+            else:
+                subdevices.append(child_model(ref))
+
+        if subdevices:
+            # Bypass validation: assigning to the field would revalidate every
+            # child (pydantic v1 replaces them with copies), which detaches the
+            # controller state the caller still holds a reference to.
+            entity.__dict__["subdevices"] = subdevices
+            if hasattr(entity, "rebuild_channel_dict"):
+                entity.rebuild_channel_dict()
+        return entity
 
     def get_subdevices(self) -> list:
         if self.subdevices is None:

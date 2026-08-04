@@ -1599,3 +1599,149 @@ def test_handle_data_change_calls_on_archive_error_when_offline():
 
     if os.path.exists(archive.buffer_offline_location):
         os.unlink(archive.buffer_offline_location)
+
+
+# -- Component hierarchy tests --
+
+
+class _FakeOsw:
+    """Minimal stand-in for osw.core.OSW used by load_from_osw."""
+
+    class LoadEntityParam:
+        def __init__(self, titles, autofetch_schema=True, model_to_use=None):
+            self.titles = titles if isinstance(titles, list) else [titles]
+            self.autofetch_schema = autofetch_schema
+            self.model_to_use = model_to_use
+
+    class _Result:
+        def __init__(self, entities):
+            self.entities = entities
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def load_entity(self, param):
+        title = param.titles[0]
+        self.calls.append((title, param.model_to_use, param.autofetch_schema))
+        return self._Result([param.model_to_use(**self.pages[title])])
+
+
+def _osw_fixture():
+    from uuid import uuid4
+
+    from opensemantic.base._model import Component, DataChannel
+
+    def _channel(name):
+        return DataChannel(uuid=str(uuid4()), osw_id=name, name=name)
+
+    def _component(instance_iri, type_iri):
+        return Component(
+            uuid=str(uuid4()),
+            component_id="Component01",
+            component_instance=instance_iri,
+            component_type=type_iri,
+        )
+
+    pages = {
+        "Item:OSWroot": {
+            "name": "root",
+            "label": [Label(text="Root")],
+            "data_channels": [_channel("root_ch")],
+            "components": [
+                _component("Item:OSWchildA", "Category:OSWtypeA"),
+                _component("Item:OSWchildB", "Category:OSWtypeB"),
+            ],
+        },
+        "Item:OSWchildA": {
+            "name": "child_a",
+            "label": [Label(text="Child A")],
+            "data_channels": [_channel("a_ch")],
+            "components": [_component("Item:OSWgrandchild", "Category:OSWtypeA")],
+        },
+        "Item:OSWchildB": {
+            "name": "child_b",
+            "label": [Label(text="Child B")],
+            "data_channels": [_channel("b_ch")],
+        },
+        "Item:OSWgrandchild": {
+            "name": "grandchild",
+            "label": [Label(text="Grandchild")],
+            "data_channels": [_channel("g_ch")],
+        },
+    }
+    return _FakeOsw(pages)
+
+
+def test_load_from_osw_builds_subdevice_tree():
+    from opensemantic.base import DataToolController
+
+    osw = _osw_fixture()
+    root = DataToolController.load_from_osw(osw, "Item:OSWroot")
+
+    assert root.name == "root"
+    assert [sub.name for sub in root.subdevices] == ["child_a", "child_b"]
+    assert {sub.name for sub in root.get_subdevices()} == {
+        "child_a",
+        "child_b",
+        "grandchild",
+    }
+    assert {ch.name for ch in root.get_all_channels()} == {
+        "root_ch",
+        "a_ch",
+        "b_ch",
+        "g_ch",
+    }
+
+
+def test_load_from_osw_indexes_subdevice_channels():
+    """The channel dict has to cover the subdevices wired in after __init__."""
+    from opensemantic.base import DataToolController
+
+    osw = _osw_fixture()
+    root = DataToolController.load_from_osw(osw, "Item:OSWroot")
+
+    indexed = {ch.name for ch in root._channel_dict.values()}
+    assert indexed == {"root_ch", "a_ch", "b_ch", "g_ch"}
+
+
+def test_load_from_osw_never_autofetches_schemas():
+    """Schemas come from the installed packages, not from ad-hoc generation."""
+    from opensemantic.base import DataToolController
+
+    osw = _osw_fixture()
+    DataToolController.load_from_osw(osw, "Item:OSWroot")
+
+    assert osw.calls, "no entity was loaded"
+    assert all(autofetch is False for _, _, autofetch in osw.calls)
+
+
+def test_load_from_osw_selects_model_per_component_type():
+    from opensemantic.base import DataToolController
+
+    class TypeAController(DataToolController):
+        pass
+
+    osw = _osw_fixture()
+    root = DataToolController.load_from_osw(
+        osw,
+        "Item:OSWroot",
+        model_by_component_type={"Category:OSWtypeA": TypeAController},
+    )
+
+    by_name = {sub.name: sub for sub in root.get_subdevices()}
+    assert isinstance(by_name["child_a"], TypeAController)
+    assert isinstance(by_name["grandchild"], TypeAController)
+    assert not isinstance(by_name["child_b"], TypeAController)
+
+
+def test_load_from_osw_respects_depth_and_extra_kwargs():
+    from opensemantic.base import DataToolController
+
+    osw = _osw_fixture()
+    root = DataToolController.load_from_osw(
+        osw, "Item:OSWroot", depth=1, auto_archive=False
+    )
+
+    assert {sub.name for sub in root.get_subdevices()} == {"child_a", "child_b"}
+    assert root.subdevices[0].subdevices == []
