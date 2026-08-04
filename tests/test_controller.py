@@ -1523,3 +1523,79 @@ def test_buffered_performance():
     assert (
         t_buf < t_unbuf / 5
     ), f"Buffered ({t_buf:.3f}s) not 5x faster than unbuffered ({t_unbuf:.3f}s)"
+
+
+# -- Offline flag forwarding tests --
+
+
+def _make_offline_archive(**kwargs):
+    """PostgREST controller without a client, offline buffer in a temp file."""
+    from opensemantic.base import PostgrestTimeSeriesDatabaseController
+
+    return PostgrestTimeSeriesDatabaseController(
+        name="offline_test",
+        label=[Label(text="Offline Test")],
+        buffer_offline_location=tempfile.NamedTemporaryFile(
+            suffix=".sqlite", delete=False
+        ).name,
+        **kwargs,
+    )
+
+
+def test_postgrest_controller_forwards_offline_flag():
+    """The driver's _offline flag must be readable on the controller."""
+    db = _make_offline_archive()
+    assert db._offline is False
+    db._driver._offline = True
+    assert db._offline is True
+
+
+def test_postgrest_controller_forwards_emulate_offline_flag():
+    """_emulate_offline is settable on the controller and reaches the driver."""
+    db = _make_offline_archive()
+    assert db._emulate_offline is False
+    db._emulate_offline = True
+    assert db._driver._emulate_offline is True
+
+
+def test_handle_data_change_calls_on_archive_error_when_offline():
+    """Going offline during archiving must trigger the _on_archive_error hook."""
+    import datetime
+    from uuid import uuid4
+
+    from opensemantic.base import DataToolController
+    from opensemantic.base._controller_mixin import DataToolMixin
+    from opensemantic.base._model import DataChannel
+
+    class RecordingController(DataToolController):
+        def _on_archive_error(self):
+            self._archive_errors = getattr(self, "_archive_errors", 0) + 1
+
+    archive = _make_offline_archive(buffered=True, buffer_batch_size=1)
+    archive._emulate_offline = True
+
+    ch = DataChannel(uuid=str(uuid4()), osw_id="ch1", name="ch1")
+    ctrl = RecordingController(
+        name="test",
+        label=[Label(text="Test")],
+        data_channels=[ch],
+        auto_archive=True,
+    )
+    ctrl.archive_database = archive
+
+    async def _test():
+        await ctrl._handle_data_change(
+            DataToolMixin.ChannelDataChangeNotificationParams(
+                channel=ch,
+                value=42.0,
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+        )
+
+    asyncio.run(_test())
+
+    assert archive._offline is True
+    assert getattr(ctrl, "_archive_errors", 0) == 1
+
+    if os.path.exists(archive.buffer_offline_location):
+        os.unlink(archive.buffer_offline_location)

@@ -116,6 +116,25 @@ try:
         def set_client(self, client):
             self._driver.set_client(client)
 
+        @property
+        def _offline(self) -> bool:
+            """True while the remote is unreachable and writes are buffered.
+
+            The flag lives on the driver. Consumers check it on the controller
+            (DataToolMixin._handle_data_change) to detect the online/offline
+            transition, so it has to be readable here.
+            """
+            return getattr(self._driver, "_offline", False)
+
+        @property
+        def _emulate_offline(self) -> bool:
+            """Test hook: force the driver to behave as if the remote is down."""
+            return getattr(self._driver, "_emulate_offline", False)
+
+        @_emulate_offline.setter
+        def _emulate_offline(self, value: bool):
+            self._driver._emulate_offline = value
+
         async def create_tool(self, params: TSDCMixin.CreateToolParams):
             return await self._driver.create_tool(params.tool_osw_id)
 
