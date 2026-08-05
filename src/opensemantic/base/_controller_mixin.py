@@ -20,6 +20,15 @@ from pydantic import BaseModel, ConfigDict
 _logger = logging.getLogger(__name__)
 
 
+def short_osw_id(osw_id: str) -> str:
+    """The bare id of a subobject, without its parent prefix.
+
+    Channels carry a composite osw_id (``Item:OSW<tool>#OSW<channel>``) but are
+    stored and referenced by the part after the separator.
+    """
+    return osw_id.split("#")[-1]
+
+
 class DownsampleParams(BaseModel):
     """Server-side downsampling request (PostgREST/TimescaleDB backend).
 
@@ -505,6 +514,22 @@ class DataToolMixin(BaseController):
             f"Available: {[ch.name for ch in self.get_all_channels()]}"
         )
 
+    def get_channel_by_osw_id(self, osw_id: str):
+        """Look up a channel by osw_id across self and all subdevices.
+
+        Accepts the full subobject IRI (``Item:OSW<tool>#OSW<channel>``) as
+        well as the bare ``OSW<channel>`` suffix, so a reference stored in the
+        OSW backend resolves regardless of which form it uses.
+
+        Raises ValueError if no channel with the given osw_id is found.
+        """
+        suffix = short_osw_id(osw_id)
+        for ch in self.get_all_channels():
+            ch_osw_id = getattr(ch, "osw_id", None)
+            if ch_osw_id and short_osw_id(ch_osw_id) == suffix:
+                return ch
+        raise ValueError(f"No channel with osw_id '{osw_id}' found.")
+
     def _resolve_channel(self, channel):
         """Resolve a channel argument: pass through if already an object,
         look up by name if string."""
@@ -611,9 +636,7 @@ class DataToolMixin(BaseController):
                     tool_osw_id = owner.get_osw_id()
                     value = self._value_to_store_data(params.value, params.channel)
                     # Use just the channel's own ID (child part of subobject ID)
-                    ch_osw_id = params.channel.get_osw_id()
-                    if "#" in ch_osw_id:
-                        ch_osw_id = ch_osw_id.split("#", 1)[1]
+                    ch_osw_id = short_osw_id(params.channel.get_osw_id())
                     offline_before = getattr(self.archive_database, "_offline", False)
                     await self.archive_database.write_tool_channel_raw(
                         TSDCMixin.WriteToolChannelRawParams(
@@ -786,9 +809,7 @@ class DataToolMixin(BaseController):
 
         data = self._value_to_store_data(value, channel)
 
-        ch_osw_id = channel.get_osw_id()
-        if "#" in ch_osw_id:
-            ch_osw_id = ch_osw_id.split("#")[-1]
+        ch_osw_id = short_osw_id(channel.get_osw_id())
         tool_osw_id = self.get_osw_id()
 
         await self.archive_database.write_tool_channel_raw(
@@ -864,9 +885,7 @@ class DataToolMixin(BaseController):
 
         for series in params.series:
             channel = self._resolve_channel(series.channel)
-            ch_osw_id = channel.get_osw_id()
-            if "#" in ch_osw_id:
-                ch_osw_id = ch_osw_id.split("#")[-1]
+            ch_osw_id = short_osw_id(channel.get_osw_id())
             n = min(len(series.timestamps), len(series.values))
             for i in range(n):
                 data = self._value_to_store_data(series.values[i], channel)
@@ -918,11 +937,7 @@ class DataToolMixin(BaseController):
             channels = [channels]
 
         # Build channel ID -> channel lookup
-        ch_by_id = {}
-        for ch in channels:
-            osw_id = ch.get_osw_id()
-            short_id = osw_id.split("#")[-1] if "#" in osw_id else osw_id
-            ch_by_id[short_id] = ch
+        ch_by_id = {short_osw_id(ch.get_osw_id()): ch for ch in channels}
 
         # Query: if single channel, filter by ID; otherwise get all
         ch_osw_id = None
