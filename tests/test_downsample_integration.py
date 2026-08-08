@@ -12,6 +12,7 @@ PostgREST client (an httpx.AsyncClient) is not torn down between calls.
 import asyncio
 import datetime as dt
 import os
+import time
 
 import pytest
 
@@ -329,3 +330,45 @@ def test_edge_anchors_present(seeded):
     # First/last returned rows are the window's first/last real datapoints.
     assert float(with_anchors[0]["data"]["value"]) == 0.0
     assert float(with_anchors[-1]["data"]["value"]) == float(WINDOW_SECONDS - 1)
+
+
+@pytest.mark.parametrize("channel_key", ["ch_scalar", "ch_comp"])
+def test_benchmark_methods(seeded, record_property, channel_key):
+    """Time a full-resolution read against each strategy and report.
+
+    Only deterministic payload invariants are asserted; the wall times are
+    attached as test properties (and printed under ``-s``) so a regression is
+    visible without tying the suite to machine speed. For real numbers across
+    escalating series sizes use ``benchmarks/bench_downsample.py``.
+    """
+    ch = seeded[channel_key]
+    results = {}
+    for method in (None, "sample", "average", "minmax"):
+        t0 = time.perf_counter()
+        rows = _read(
+            seeded,
+            ch,
+            start=seeded["start"],
+            end=seeded["end"],
+            max_points=None if method is None else MAX_POINTS,
+            downsample_method=method,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        name = method or "raw"
+        results[name] = (elapsed_ms, len(rows))
+        record_property(f"{channel_key}_{name}_ms", round(elapsed_ms, 1))
+        record_property(f"{channel_key}_{name}_rows", len(rows))
+
+    print(
+        f"\n{channel_key}: "
+        + "  ".join(f"{name}={ms:.0f}ms/{n}rows" for name, (ms, n) in results.items())
+    )
+
+    raw_rows = results["raw"][1]
+    assert raw_rows == N_POINTS
+    # Every strategy must actually shrink the payload for this window.
+    for method in ("sample", "average", "minmax"):
+        assert results[method][1] < raw_rows / 2, f"{method} did not reduce rows"
+    # minmax keeps up to two real rows per bucket, so it never returns less
+    # than sample, which keeps one.
+    assert results["minmax"][1] >= results["sample"][1]
