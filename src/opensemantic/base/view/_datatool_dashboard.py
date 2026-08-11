@@ -530,24 +530,45 @@ class DataToolView(BaseDataView):
         method = resolve_downsample_method(channel, ds.method.value)
         return ds.max_points, method, ds.edge_anchors
 
-    def _make_figures(self):
-        """Build a fresh list of Bokeh figures (one per group) from the cache.
+    def _collect_traces(self):
+        """Extract per-group plot traces from the cache in one pass.
 
-        Returns ``(figs, shared_x_range)``. The figures are not attached to any
-        pane/document, so this is reused both for live rendering and for a
-        detached copy for HTML export (a model may live in only one document).
+        Returns an ordered list of ``(group_key, axis_label, [(trace_name,
+        timestamps, values), ...])`` for every non-text group that has data.
+        Shared by the live build, the in-place update and HTML export so the
+        data is extracted (and unit-converted) once.
         """
-        plot_groups = []
+        traces = []
         for group_key, channels in self._groups.items():
             if not channels:
                 continue
-            sample_ch = channels[0][1]
-            vtype = resolve_value_type(sample_ch)
-            if vtype == "text":
+            if resolve_value_type(channels[0][1]) == "text":
                 continue
-            plot_groups.append((group_key, channels, vtype))
+            series = []
+            for ctrl, ch in channels:
+                timestamps, values = self._extract_trace_data(ch, group_key)
+                if len(timestamps):
+                    trace_name = (
+                        f"{get_display_label(ctrl, self.lang)}/"
+                        f"{get_display_label(ch, self.lang)}"
+                    )
+                    series.append((trace_name, timestamps, values))
+            if series:
+                traces.append((group_key, self._get_axis_label(group_key), series))
+        return traces
 
-        if not plot_groups:
+    def _make_figures(self, traces=None, source_map=None, group_map=None):
+        """Build one Bokeh figure per group from collected traces.
+
+        Returns ``(figs, shared_x_range)``. ``traces`` defaults to a fresh
+        extraction, so this doubles as the detached builder for HTML export.
+        When given, ``source_map``/``group_map`` are populated with the
+        per-trace ColumnDataSource and per-group figure so a later refresh can
+        update them in place instead of rebuilding.
+        """
+        if traces is None:
+            traces = self._collect_traces()
+        if not traces:
             return [], None
 
         # One shared x-range for every figure, so panning, zooming or resetting
@@ -559,8 +580,7 @@ class DataToolView(BaseDataView):
 
         figs = []
         color_idx = 0
-        for group_key, channels, vtype in plot_groups:
-            axis_label = self._get_axis_label(group_key)
+        for group_key, axis_label, series in traces:
             fig = bk_figure(
                 height=250,
                 sizing_mode="stretch_width",
@@ -582,42 +602,64 @@ class DataToolView(BaseDataView):
                 hours="%H:%M",
             )
 
-            for ctrl, ch in channels:
-                timestamps, values = self._extract_trace_data(ch, group_key)
-                if timestamps:
-                    trace_name = (
-                        f"{get_display_label(ctrl, self.lang)}/"
-                        f"{get_display_label(ch, self.lang)}"
-                    )
-                    src = ColumnDataSource(data={"x": timestamps, "y": values})
-                    fig.line(
-                        "x",
-                        "y",
-                        source=src,
-                        legend_label=trace_name,
-                        color=COLORS[color_idx % len(COLORS)],
-                        line_width=2,
-                    )
-                    color_idx += 1
+            for trace_name, timestamps, values in series:
+                src = ColumnDataSource(data={"x": timestamps, "y": values})
+                fig.line(
+                    "x",
+                    "y",
+                    source=src,
+                    legend_label=trace_name,
+                    color=COLORS[color_idx % len(COLORS)],
+                    line_width=2,
+                )
+                color_idx += 1
+                if source_map is not None:
+                    source_map[(group_key, trace_name)] = src
 
             fig.legend.click_policy = "hide"
+            if group_map is not None:
+                group_map[group_key] = fig
             figs.append(fig)
         return figs, shared_x
 
     def _build_figure(self):
-        """Build Bokeh figures - one per characteristic group."""
+        """Build or update the plot: one figure per characteristic group.
+
+        Rebuilds the panes only when the trace set (groups x channels) changes;
+        otherwise updates the existing ColumnDataSources (and axis labels) in
+        place, which avoids re-serializing whole Bokeh models to the browser on
+        every reload or unit switch. The in-place mutation is scheduled on the
+        Bokeh document (see _schedule_doc) to avoid the async load's doc lock.
+        """
+        traces = self._collect_traces()
+        signature = tuple(
+            (gk, tn) for gk, _al, series in traces for (tn, _ts, _v) in series
+        )
+        sources = getattr(self, "_trace_sources", None)
+        if (
+            signature
+            and signature == getattr(self, "_plot_signature", None)
+            and sources
+            and all((gk, tn) in sources for gk, tn in signature)
+        ):
+            self._update_plot_in_place(traces)
+            return
+
         self._plot_col.clear()
-        figs, shared_x = self._make_figures()
+        source_map: dict = {}
+        group_map: dict = {}
+        figs, shared_x = self._make_figures(traces, source_map, group_map)
         self._figures = figs
+        self._trace_sources = source_map
+        self._group_figures = group_map
+        self._plot_signature = signature if figs else None
         if not figs:
             return
 
         # Keep the shared range for "Load current range" and bridge the Reset
         # event: figure.on_event(Reset) does not propagate through Panel's Bokeh
         # pane, so a CustomJS on the Reset event bumps _reset_bridge, whose
-        # server-side on_change reloads. Done while the figures are still
-        # detached - mutating models already in the live document from this
-        # async load task raises a document-lock error.
+        # server-side on_change reloads.
         self._shared_x_range = shared_x
         reset_cb = CustomJS(
             args={"bridge": self._reset_bridge},
@@ -628,6 +670,47 @@ class DataToolView(BaseDataView):
 
         for fig in figs:
             self._plot_col.append(pn.pane.Bokeh(fig, sizing_mode="stretch_width"))
+
+    def _update_plot_in_place(self, traces):
+        """Update existing figures' data and axis labels without new panes."""
+        sources = self._trace_sources
+        group_figs = getattr(self, "_group_figures", {})
+        updates = []
+        for group_key, _axis_label, series in traces:
+            for trace_name, timestamps, values in series:
+                src = sources.get((group_key, trace_name))
+                if src is not None:
+                    updates.append((src, {"x": timestamps, "y": values}))
+
+        def _apply():
+            for src, data in updates:
+                src.data = data
+            for group_key, axis_label, _series in traces:
+                fig = group_figs.get(group_key)
+                if fig is not None:
+                    fig.yaxis.axis_label = axis_label
+            # The shared x-range is left untouched: an auto range (never zoomed)
+            # re-follows the new data on the CDS update, and a prior box-zoom is
+            # intentionally preserved so "Load current range" keeps the window.
+
+        self._schedule_doc(_apply)
+
+    def _schedule_doc(self, fn):
+        """Run a Bokeh-model mutation on the document thread when live.
+
+        Mutating live models directly from the async load task raises a
+        document-lock error, so schedule on the session document's next tick.
+        Falls back to a direct call when there is no live document (tests,
+        initial synchronous build).
+        """
+        doc = getattr(pn.state, "curdoc", None)
+        if doc is not None and getattr(doc, "session_context", None) is not None:
+            try:
+                doc.add_next_tick_callback(fn)
+                return
+            except Exception:
+                pass
+        fn()
 
     def _export_figures(self):
         """Fresh, unattached figures for HTML export (see _make_figures)."""

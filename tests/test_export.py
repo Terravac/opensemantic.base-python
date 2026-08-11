@@ -222,3 +222,51 @@ def test_datatool_export_series_and_figures():
                 os.remove(path)
             except OSError:
                 pass
+
+
+def test_inplace_update_reuses_sources_on_unit_change():
+    """A unit switch updates the existing ColumnDataSources in place.
+
+    Same trace set -> _build_figure takes the in-place path: the same CDS
+    objects are reused (no pane rebuild) and their y values are re-converted to
+    the newly selected display unit.
+    """
+    from opensemantic.base.view._channel_utils import get_unit_enum
+
+    view, ctrl = _loaded_view()
+    try:
+        sources_before = dict(view._trace_sources)
+        assert sources_before  # the initial full build populated them
+        sig_before = view._plot_signature
+        ids_before = {k: id(v) for k, v in sources_before.items()}
+
+        key = next(iter(sources_before))
+        y_kelvin = list(sources_before[key].data["y"])
+
+        group_key = next(iter(view._groups))
+        sample_ch = view._groups[group_key][0][1]
+        enum = get_unit_enum(sample_ch)
+        alt = next(m.name for m in enum if m.name != "kelvin")
+
+        view._unit_selections[group_key] = alt
+        view._refresh_plot()
+
+        # In-place: signature unchanged and the same CDS objects reused.
+        assert view._plot_signature == sig_before
+        assert {k: id(v) for k, v in view._trace_sources.items()} == ids_before
+
+        # Values were re-converted to the new unit (no live doc -> applied now).
+        y_alt = list(view._trace_sources[key].data["y"])
+        assert len(y_alt) == len(y_kelvin)
+        assert y_alt != y_kelvin
+    finally:
+        db = ctrl.archive_database
+        drv = getattr(db, "_driver", None)
+        path = getattr(drv, "db_path", None) if drv else None
+        if path:
+            import os
+
+            try:
+                os.remove(path)
+            except OSError:
+                pass
