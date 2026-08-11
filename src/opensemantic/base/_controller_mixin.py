@@ -956,6 +956,12 @@ class DataToolMixin(BaseController):
         )
 
         results: List["DataToolMixin.ChannelDataPoint"] = []
+        # The typed branch's display unit is loop-invariant per characteristic
+        # class, so resolve it once per class instead of rebuilding
+        # ``cls(value=0, unit=ch_unit)`` for every row. Cached by class object;
+        # a value of None means "no conversion" (channel has no declared unit).
+        target_unit_cache: dict = {}
+
         for row in raw:
             ch = ch_by_id.get(row["ch"])
             if ch is None and len(ch_by_id) > 1:
@@ -968,11 +974,19 @@ class DataToolMixin(BaseController):
                     cls = self._resolve_characteristic_class(ch)
                 if cls is not None:
                     value = cls.from_json(value)
-                    ch_unit = getattr(ch, "unit", None) if ch else None
-                    if ch_unit is not None and hasattr(value, "to_unit"):
+                    if cls not in target_unit_cache:
+                        ch_unit = getattr(ch, "unit", None) if ch else None
+                        resolved = None
+                        if ch_unit is not None:
+                            try:
+                                resolved = cls(value=0, unit=ch_unit).unit
+                            except Exception:
+                                resolved = None
+                        target_unit_cache[cls] = resolved
+                    target_unit = target_unit_cache[cls]
+                    if target_unit is not None and hasattr(value, "to_unit"):
                         try:
-                            target = cls(value=0, unit=ch_unit)
-                            value = value.to_unit(target.unit)
+                            value = value.to_unit(target_unit)
                         except Exception:
                             pass
 

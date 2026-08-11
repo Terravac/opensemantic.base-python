@@ -37,10 +37,13 @@ from opensemantic.base.view._channel_utils import (
     flatten_composite_channels,
     get_display_label,
     get_selected_channels,
+    get_unit_enum,
     get_unit_enum_from_value,
     group_channels_by_characteristic,
+    resolve_characteristic_class,
     resolve_downsample_method,
     resolve_value_type,
+    to_display_magnitudes,
 )
 from opensemantic.base.view._config import (
     BaseViewConfig,
@@ -488,6 +491,7 @@ class DataToolView(BaseDataView):
                         start,
                         end,
                         limit,
+                        typed=False,
                         max_points=mp,
                         method=method,
                         edge_anchors=edge,
@@ -501,6 +505,7 @@ class DataToolView(BaseDataView):
                         start,
                         end,
                         limit,
+                        typed=False,
                         max_points=mp,
                         method=method,
                         edge_anchors=edge,
@@ -679,14 +684,76 @@ class DataToolView(BaseDataView):
         self._zoom_window = None
         self._trigger_load()
 
-    def _extract_trace_data(self, ch: Any, group_key: str) -> Tuple[List, List]:
-        """Extract timestamps and values from cached ChannelDataPoints.
+    @staticmethod
+    def _naive_local(ts: Any) -> Any:
+        """Normalize a timestamp to a naive local datetime for plotting."""
+        if isinstance(ts, str):
+            ts = dt.datetime.fromisoformat(ts)
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(tz=None).replace(tzinfo=None)
+        return ts
 
-        Handles regular channels and composite sub-channels.
-        For composite sub-channels, reads from the parent's cache and extracts
-        the named sub-field.
+    @staticmethod
+    def _leaf_number(v: Any) -> Any:
+        """Extract the bare numeric leaf from a cached value (dict/typed/scalar)."""
+        if isinstance(v, dict):
+            return v.get("value")
+        if hasattr(v, "value"):
+            return v.value
+        if isinstance(v, (int, float)):
+            return v
+        return None
+
+    def _series_units(
+        self, ch: Any, group_key: str, raw0: Any, field: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve ``(source_unit, target_unit)`` pint strings for a series.
+
+        Builds one representative typed value from the first raw row to read the
+        stored (source) unit and the display (target) unit, so the per-point
+        unit conversion can be replaced by a single vectorized pass. The display
+        unit is the group's selected unit, else the channel's declared unit
+        (scalar), else the stored unit. Returns ``(None, None)`` when units
+        cannot be resolved (untyped / dimensionless), which skips conversion.
         """
-        # Check if this is a composite sub-channel
+        cls = resolve_characteristic_class(ch)
+        if cls is None or not hasattr(cls, "from_json"):
+            return None, None
+        try:
+            rep = cls.from_json(raw0)
+        except Exception:
+            return None, None
+        if field is not None:
+            rep = getattr(rep, field, None)
+        if rep is None or not hasattr(rep, "to_pint"):
+            return None, None
+        try:
+            source = str(rep.to_pint().units)
+        except Exception:
+            return None, None
+
+        sel = self._unit_selections.get(group_key)
+        enum = get_unit_enum(ch) if field is None else get_unit_enum_from_value(rep)
+        disp = rep
+        try:
+            if sel and enum is not None and sel in enum.__members__:
+                disp = rep.to_unit(enum[sel])
+            elif field is None:
+                ch_unit = getattr(ch, "unit", None)
+                if ch_unit is not None:
+                    disp = rep.to_unit(ch_unit)
+            target = str(disp.to_pint().units)
+        except Exception:
+            target = source
+        return source, target
+
+    def _extract_trace_data(self, ch: Any, group_key: str) -> Tuple[List, Any]:
+        """Extract timestamps and display-unit values from cached points.
+
+        Values are converted to the display unit in a single vectorized
+        pint-pandas pass (see ``_series_units``/``to_display_magnitudes``)
+        rather than per point. Handles regular and composite sub-channels.
+        """
         if ch.uuid in self._composite_parents:
             parent_ch, field_name = self._composite_parents[ch.uuid]
             return self._extract_composite_field(parent_ch, field_name, group_key)
@@ -695,98 +762,101 @@ class DataToolView(BaseDataView):
         if not points:
             return [], []
 
-        target_unit_name = self._unit_selections.get(group_key)
-        timestamps = []
-        values = []
-
+        timestamps: List = []
+        raw: List = []
         for pt in points:
-            ts = pt.timestamp
-            if isinstance(ts, str):
-                ts = dt.datetime.fromisoformat(ts)
-            if ts.tzinfo is not None:
-                ts = ts.astimezone(tz=None).replace(tzinfo=None)
-            timestamps.append(ts)
-            values.append(self._numeric(pt.value, ch, target_unit_name))
+            v = self._leaf_number(pt.value)
+            if v is None:
+                continue
+            timestamps.append(self._naive_local(pt.timestamp))
+            raw.append(v)
+        if not raw:
+            return [], []
 
-        return timestamps, values
+        # Text / non-numeric series (log channels, exported alongside plots)
+        # pass through unconverted; only numeric series get the vectorized
+        # pint-pandas unit conversion.
+        if not all(isinstance(v, (int, float)) for v in raw):
+            return timestamps, raw
+
+        source, target = self._series_units(ch, group_key, points[0].value)
+        return timestamps, to_display_magnitudes(raw, source, target)
 
     def _extract_composite_field(
         self, parent_ch: Any, field_name: str, group_key: str
-    ) -> Tuple[List, List]:
-        """Extract a sub-field from composite ChannelDataPoints.
+    ) -> Tuple[List, Any]:
+        """Extract a sub-field from composite points, vectorizing the conversion.
 
         Reads from the parent channel's cache and extracts the named field.
-        Works with both typed objects and raw dicts (from typed=False loading).
+        Works with both raw dicts (typed=False loading) and typed objects.
         """
         points = self._cached_data.get(parent_ch.uuid, [])
         if not points:
             return [], []
 
-        target_unit_name = self._unit_selections.get(group_key)
-        timestamps = []
-        values = []
-
+        timestamps: List = []
+        raw: List = []
         for pt in points:
-            ts = pt.timestamp
-            if isinstance(ts, str):
-                ts = dt.datetime.fromisoformat(ts)
-            if ts.tzinfo is not None:
-                ts = ts.astimezone(tz=None).replace(tzinfo=None)
-
             value = pt.value
-            # Extract sub-field from composite (dict or typed object)
             if isinstance(value, dict):
                 sub = value.get(field_name)
             elif hasattr(value, field_name):
                 sub = getattr(value, field_name)
             else:
                 continue
-
-            if sub is None:
+            v = self._leaf_number(sub) if sub is not None else None
+            if v is None:
                 continue
+            timestamps.append(self._naive_local(pt.timestamp))
+            raw.append(v)
+        if not raw:
+            return [], []
 
-            # Sub-field may be a dict (raw) or typed object
-            if isinstance(sub, dict):
-                v = sub.get("value")
-                if v is not None:
-                    timestamps.append(ts)
-                    values.append(v)
-            elif hasattr(sub, "value"):
-                # Unit conversion on typed sub-field
-                if target_unit_name and hasattr(sub, "to_unit"):
-                    unit_enum = get_unit_enum_from_value(sub)
-                    if unit_enum and target_unit_name in unit_enum.__members__:
-                        try:
-                            sub = sub.to_unit(unit_enum[target_unit_name])
-                        except Exception:
-                            pass
-                timestamps.append(ts)
-                values.append(sub.value)
-            elif isinstance(sub, (int, float)):
-                timestamps.append(ts)
-                values.append(sub)
+        if not all(isinstance(v, (int, float)) for v in raw):
+            return timestamps, raw
 
-        return timestamps, values
+        source, target = self._series_units(
+            parent_ch, group_key, points[0].value, field=field_name
+        )
+        return timestamps, to_display_magnitudes(raw, source, target)
 
     # -- Export --
 
     def _representative_value(self, ch: Any) -> Any:
-        """A typed (Characteristic) value from the channel's cache, or None."""
+        """A typed (Characteristic) value for the channel, or None.
+
+        The plot cache holds raw dicts (typed=False), so a raw value is typed on
+        demand via the characteristic class - one build per channel, only for
+        export/unit-label needs, not per point.
+        """
         if ch.uuid in self._composite_parents:
             parent_ch, field_name = self._composite_parents[ch.uuid]
+            cls = resolve_characteristic_class(parent_ch)
             for pt in self._cached_data.get(parent_ch.uuid, []):
                 val = pt.value
-                sub = (
-                    val.get(field_name)
-                    if isinstance(val, dict)
-                    else getattr(val, field_name, None)
-                )
+                if isinstance(val, dict):
+                    if cls is None or not hasattr(cls, "from_json"):
+                        continue
+                    try:
+                        val = cls.from_json(val)
+                    except Exception:
+                        continue
+                sub = getattr(val, field_name, None)
                 if sub is not None and hasattr(sub, "to_pint"):
                     return sub
             return None
+        cls = resolve_characteristic_class(ch)
         for pt in self._cached_data.get(ch.uuid, []):
-            if hasattr(pt.value, "to_pint"):
-                return pt.value
+            val = pt.value
+            if isinstance(val, dict):
+                if cls is None or not hasattr(cls, "from_json"):
+                    continue
+                try:
+                    val = cls.from_json(val)
+                except Exception:
+                    continue
+            if hasattr(val, "to_pint"):
+                return val
         return None
 
     def _series_unit(self, ch: Any, group_key: str) -> str:
@@ -828,7 +898,9 @@ class DataToolView(BaseDataView):
                     {
                         "label": label,
                         "x": x,
-                        "y": y,
+                        # y is a numpy array for numeric series (vectorized
+                        # conversion); export records keep the list contract.
+                        "y": list(y),
                         "x_kind": "datetime",
                         "unit": None if is_text else self._series_unit(ch, group_key),
                     }

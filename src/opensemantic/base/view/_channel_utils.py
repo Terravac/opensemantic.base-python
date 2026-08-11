@@ -196,6 +196,53 @@ def get_unit_enum_from_value(value: Any) -> Optional[type]:
     return None
 
 
+def align_pint_pandas_registry() -> bool:
+    """Point pint-pandas at pint's application registry.
+
+    ``pint[<unit>]`` dtypes must resolve the same (possibly custom OSW) units the
+    Characteristic classes use via ``pint.get_application_registry()``. Called
+    once at import; returns False when pandas/pint-pandas are unavailable.
+    """
+    try:
+        import pint
+        import pint_pandas
+    except Exception:
+        return False
+    try:
+        pint_pandas.PintType.ureg = pint.get_application_registry()
+    except Exception:
+        pass
+    return True
+
+
+def to_display_magnitudes(raw_values: Any, source_unit: Any, target_unit: Any) -> Any:
+    """Vectorized unit conversion of a numeric series to its display unit.
+
+    ``raw_values`` are assumed to be in ``source_unit``; returns a numpy float
+    array of magnitudes in ``target_unit``, converted in a single pint-pandas
+    operation. Falls back to the raw floats when pandas/pint-pandas are missing,
+    when the units match, or on any conversion error (e.g. an unparseable or
+    prefixed-offset unit), so a bad unit never blanks a plot.
+    """
+    import numpy as np
+
+    arr = np.asarray(raw_values, dtype="float64")
+    if not source_unit or not target_unit or source_unit == target_unit:
+        return arr
+    try:
+        import pandas as pd
+        import pint_pandas  # noqa: F401
+
+        series = pd.Series(arr, dtype=f"pint[{source_unit}]")
+        converted = series.pint.to(target_unit).pint.magnitude
+        return np.asarray(converted, dtype="float64")
+    except Exception:
+        return arr
+
+
+align_pint_pandas_registry()
+
+
 def get_available_units(channel: Any) -> List[Dict[str, str]]:
     """Get all available units for a channel's characteristic.
 
