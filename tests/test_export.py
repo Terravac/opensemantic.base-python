@@ -270,3 +270,138 @@ def test_inplace_update_reuses_sources_on_unit_change():
                 os.remove(path)
             except OSError:
                 pass
+
+
+def _cleanup(ctrl):
+    db = ctrl.archive_database
+    drv = getattr(db, "_driver", None)
+    path = getattr(drv, "db_path", None) if drv else None
+    if path:
+        import os
+
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def test_hover_tool_present_with_time_and_value():
+    """Each plot figure has a hover tool reporting timestamp and value."""
+    from bokeh.models import HoverTool
+
+    view, ctrl = _loaded_view()
+    try:
+        assert view.figures
+        hovers = view.figures[0].select(HoverTool)
+        assert hovers, "no HoverTool on the figure"
+        tips = dict(hovers[0].tooltips)
+        assert "time" in tips and "value" in tips
+        assert tips["value"].startswith("@y")
+        assert hovers[0].formatters.get("@x") == "datetime"
+    finally:
+        _cleanup(ctrl)
+
+
+def test_hover_unit_updates_on_unit_switch():
+    """The hover value template carries the display unit and follows a switch."""
+    from bokeh.models import HoverTool
+
+    from opensemantic.base.view._channel_utils import (
+        get_available_units,
+        get_unit_enum,
+    )
+
+    view, ctrl = _loaded_view()
+    try:
+        group_key = next(iter(view._groups))
+        sample_ch = view._groups[group_key][0][1]
+        by_name = {u["name"]: u["symbol"] for u in get_available_units(sample_ch)}
+        enum = get_unit_enum(sample_ch)
+        alt = next(m.name for m in enum if m.name != "kelvin" and m.name in by_name)
+
+        view._unit_selections[group_key] = alt
+        view._refresh_plot()
+
+        tips = dict(view.figures[0].select(HoverTool)[0].tooltips)
+        assert by_name[alt] in tips["value"]
+    finally:
+        _cleanup(ctrl)
+
+
+def test_set_plot_loading_toggles_spinner():
+    view, ctrl = _loaded_view()
+    try:
+        assert view._plot_col.loading is False  # cleared after the initial load
+        view._set_plot_loading(True)
+        assert view._plot_col.loading is True
+        view._set_plot_loading(False)
+        assert view._plot_col.loading is False
+    finally:
+        _cleanup(ctrl)
+
+
+def test_load_and_plot_wraps_with_loading():
+    """_load_and_plot turns the spinner on for the fetch and off at the end."""
+    view, ctrl = _loaded_view()
+    try:
+        calls = []
+        view._set_plot_loading = lambda flag: calls.append(bool(flag))
+        asyncio.run(view._load_and_plot())
+        assert calls, "loading was never toggled"
+        assert calls[0] is True
+        assert calls[-1] is False
+    finally:
+        _cleanup(ctrl)
+
+
+def test_hover_tooltip_renders_in_browser(tmp_path):
+    """Playwright: the exported plot renders with a wired hover tool.
+
+    Loads the standalone HTML export (same figures + HoverTool + data as the
+    live plot) in a real browser and inspects the rendered Bokeh document for a
+    HoverTool whose tooltip reports time + value with the display unit. This is
+    deterministic; a pixel-perfect mouse hover over a short line is not. Skips if
+    Playwright or a browser is unavailable.
+    """
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+
+    view, ctrl = _loaded_view()
+    try:
+        html = view._build_plot_html().getvalue().decode()
+        page_file = tmp_path / "plot.html"
+        page_file.write_text(html, encoding="utf-8")
+
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch()
+            except Exception as exc:  # noqa: BLE001
+                pytest.skip(f"no browser: {exc}")
+            page = browser.new_page()
+            page.goto(page_file.as_uri(), wait_until="load")
+            page.wait_for_selector("canvas", timeout=30000)
+            page.wait_for_function(
+                "() => window.Bokeh && Bokeh.documents && Bokeh.documents.length > 0",
+                timeout=30000,
+            )
+            # Pull every HoverTool's tooltip spec out of the live Bokeh document.
+            tooltips = page.evaluate(
+                """() => {
+                    const out = [];
+                    for (const doc of Bokeh.documents) {
+                        for (const m of doc._all_models.values()) {
+                            if (m.type === 'HoverTool') out.push(m.tooltips);
+                        }
+                    }
+                    return out;
+                }"""
+            )
+            browser.close()
+
+        assert tooltips, "no HoverTool in the rendered Bokeh document"
+        flat = str(tooltips)
+        assert "time" in flat and "value" in flat and "@y" in flat
+        # kelvin symbol carried into the value template.
+        assert "K" in flat
+    finally:
+        _cleanup(ctrl)

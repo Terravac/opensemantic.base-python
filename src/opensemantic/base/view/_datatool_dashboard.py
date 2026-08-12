@@ -24,6 +24,7 @@ from bokeh.models import (
     CustomJS,
     DataRange1d,
     DatetimeTickFormatter,
+    HoverTool,
 )
 from bokeh.plotting import figure as bk_figure
 from panelini import Panelini
@@ -35,6 +36,7 @@ from opensemantic.base.view._channel_utils import (
     _t,
     build_tree_source,
     flatten_composite_channels,
+    get_available_units,
     get_display_label,
     get_selected_channels,
     get_unit_enum,
@@ -474,6 +476,7 @@ class DataToolView(BaseDataView):
 
         limit = self._config.plot.row_limit
         self._cached_data.clear()
+        self._set_plot_loading(True)
 
         # Load data for each channel. For composite sub-channels, load the parent.
         loaded_parents = set()
@@ -514,7 +517,10 @@ class DataToolView(BaseDataView):
             except Exception as e:
                 _logger.error("Error loading %s/%s: %s", ctrl.name, ch.name, e)
 
-        self._refresh_plot()
+        try:
+            self._refresh_plot()
+        finally:
+            self._set_plot_loading(False)
 
     def _downsample_for(self, channel):
         """Return ``(max_points, method, edge_anchors)`` for a channel.
@@ -530,13 +536,51 @@ class DataToolView(BaseDataView):
         method = resolve_downsample_method(channel, ds.method.value)
         return ds.max_points, method, ds.edge_anchors
 
+    @staticmethod
+    def _hover_tooltips(unit_symbol):
+        """Hover tooltip rows; the (constant per group) unit is baked in."""
+        value = "@y{0,0.[000000]}"
+        if unit_symbol:
+            value = f"{value} {unit_symbol}"
+        return [
+            ("series", "$name"),
+            ("time", "@x{%Y-%m-%d %H:%M:%S}"),
+            ("value", value),
+        ]
+
+    def _display_unit_symbol(self, ch, group_key):
+        """Display unit symbol for a group.
+
+        Selected unit, else the channel's declared unit, else the unit the
+        plotted values are actually stored in (matches what is plotted/exported).
+        """
+        units = get_available_units(ch)
+        if not units:
+            return ""
+        by_name = {u["name"]: u["symbol"] for u in units}
+        sel = self._unit_selections.get(group_key)
+        if sel and sel in by_name:
+            return by_name[sel]
+        ch_unit = getattr(ch, "unit", None)
+        if ch_unit is not None:
+            enum = get_unit_enum(ch)
+            if enum is not None:
+                for m in enum:
+                    if m.value == ch_unit or m.name == ch_unit:
+                        return by_name.get(m.name, "")
+        rep = self._representative_value(ch)
+        name = getattr(getattr(rep, "unit", None), "name", None)
+        if name and name in by_name:
+            return by_name[name]
+        return ""
+
     def _collect_traces(self):
         """Extract per-group plot traces from the cache in one pass.
 
-        Returns an ordered list of ``(group_key, axis_label, [(trace_name,
-        timestamps, values), ...])`` for every non-text group that has data.
-        Shared by the live build, the in-place update and HTML export so the
-        data is extracted (and unit-converted) once.
+        Returns an ordered list of ``(group_key, axis_label, unit_symbol,
+        [(trace_name, timestamps, values), ...])`` for every non-text group with
+        data. Shared by the live build, the in-place update and HTML export so
+        the data is extracted (and unit-converted) once.
         """
         traces = []
         for group_key, channels in self._groups.items():
@@ -554,7 +598,10 @@ class DataToolView(BaseDataView):
                     )
                     series.append((trace_name, timestamps, values))
             if series:
-                traces.append((group_key, self._get_axis_label(group_key), series))
+                unit_symbol = self._display_unit_symbol(channels[0][1], group_key)
+                traces.append(
+                    (group_key, self._get_axis_label(group_key), unit_symbol, series)
+                )
         return traces
 
     def _make_figures(self, traces=None, source_map=None, group_map=None):
@@ -580,7 +627,7 @@ class DataToolView(BaseDataView):
 
         figs = []
         color_idx = 0
-        for group_key, axis_label, series in traces:
+        for group_key, axis_label, unit_symbol, series in traces:
             fig = bk_figure(
                 height=250,
                 sizing_mode="stretch_width",
@@ -602,20 +649,53 @@ class DataToolView(BaseDataView):
                 hours="%H:%M",
             )
 
+            hover_renderers = []
             for trace_name, timestamps, values in series:
                 src = ColumnDataSource(data={"x": timestamps, "y": values})
+                color = COLORS[color_idx % len(COLORS)]
                 fig.line(
                     "x",
                     "y",
                     source=src,
+                    name=trace_name,
                     legend_label=trace_name,
-                    color=COLORS[color_idx % len(COLORS)],
+                    color=color,
                     line_width=2,
                 )
+                # Per-point markers, invisible until hovered, so the nearest
+                # data point is highlighted while its tooltip shows. They share
+                # the line's source, so an in-place data update covers both.
+                dots = fig.scatter(
+                    "x",
+                    "y",
+                    source=src,
+                    name=trace_name,
+                    size=8,
+                    marker="circle",
+                    fill_color=color,
+                    line_color=color,
+                    fill_alpha=0,
+                    line_alpha=0,
+                    hover_alpha=1.0,
+                )
+                hover_renderers.append(dots)
                 color_idx += 1
                 if source_map is not None:
                     source_map[(group_key, trace_name)] = src
 
+            # Hover readout: series name, exact timestamp and value, snapped to
+            # the nearest point (which the markers above highlight). The unit is
+            # baked into the template (constant per group) rather than stored per
+            # point; _update_plot_in_place refreshes it on a unit switch.
+            fig.add_tools(
+                HoverTool(
+                    renderers=hover_renderers,
+                    tooltips=self._hover_tooltips(unit_symbol),
+                    formatters={"@x": "datetime"},
+                    mode="mouse",
+                    point_policy="snap_to_data",
+                )
+            )
             fig.legend.click_policy = "hide"
             if group_map is not None:
                 group_map[group_key] = fig
@@ -633,7 +713,7 @@ class DataToolView(BaseDataView):
         """
         traces = self._collect_traces()
         signature = tuple(
-            (gk, tn) for gk, _al, series in traces for (tn, _ts, _v) in series
+            (gk, tn) for gk, _al, _us, series in traces for (tn, _ts, _v) in series
         )
         sources = getattr(self, "_trace_sources", None)
         if (
@@ -676,7 +756,7 @@ class DataToolView(BaseDataView):
         sources = self._trace_sources
         group_figs = getattr(self, "_group_figures", {})
         updates = []
-        for group_key, _axis_label, series in traces:
+        for group_key, _axis_label, _unit, series in traces:
             for trace_name, timestamps, values in series:
                 src = sources.get((group_key, trace_name))
                 if src is not None:
@@ -685,15 +765,27 @@ class DataToolView(BaseDataView):
         def _apply():
             for src, data in updates:
                 src.data = data
-            for group_key, axis_label, _series in traces:
+            for group_key, axis_label, unit_symbol, _series in traces:
                 fig = group_figs.get(group_key)
                 if fig is not None:
                     fig.yaxis.axis_label = axis_label
+                    # Refresh the hover unit (baked into the template).
+                    for hover in fig.select(HoverTool):
+                        hover.tooltips = self._hover_tooltips(unit_symbol)
             # The shared x-range is left untouched: an auto range (never zoomed)
             # re-follows the new data on the CDS update, and a prior box-zoom is
             # intentionally preserved so "Load current range" keeps the window.
 
         self._schedule_doc(_apply)
+
+    def _set_plot_loading(self, flag):
+        """Toggle the plot column's loading spinner (safe if not yet built)."""
+        col = getattr(self, "_plot_col", None)
+        if col is not None:
+            try:
+                col.loading = bool(flag)
+            except Exception:
+                pass
 
     def _schedule_doc(self, fn):
         """Run a Bokeh-model mutation on the document thread when live.
