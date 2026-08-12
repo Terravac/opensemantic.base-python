@@ -285,8 +285,14 @@ def _cleanup(ctrl):
             pass
 
 
-def test_hover_tool_present_with_time_and_value():
-    """Each plot figure has a hover tool reporting timestamp and value."""
+def test_hover_tool_wired_for_combined_tooltip():
+    """Each figure has a vline HoverTool wired to the combined-tooltip callback.
+
+    Native per-renderer tooltips are off (they render a separate box per series,
+    which overlap into "one" for same-value channels); a single tooltip with one
+    row per series is built by the callback instead, which also marks each
+    series' nearest point.
+    """
     from bokeh.models import HoverTool
 
     view, ctrl = _loaded_view()
@@ -294,18 +300,26 @@ def test_hover_tool_present_with_time_and_value():
         assert view.figures
         hovers = view.figures[0].select(HoverTool)
         assert hovers, "no HoverTool on the figure"
-        tips = dict(hovers[0].tooltips)
-        assert "time" in tips and "value" in tips
-        assert tips["value"].startswith("@y")
-        assert hovers[0].formatters.get("@x") == "datetime"
+        h = hovers[0]
+        assert h.tooltips is None, "native tooltips must be off (combined instead)"
+        assert h.mode == "vline"
+        assert h.renderers, "hover has no renderers"
+        assert all(
+            r.glyph.__class__.__name__ == "Line" for r in h.renderers
+        ), "hover must inspect line renderers"
+        assert h.callback is not None, "hover has no combined-tooltip callback"
+        args = h.callback.args
+        assert {"hl", "meta", "sources", "colors", "names"} <= set(args)
+        # one nearest-point source (and name/color) per series
+        assert len(args["sources"]) == len(args["names"]) == len(h.renderers)
+        # the value row's unit lives in meta_src (refreshed on a unit switch)
+        assert "unit" in args["meta"].data
     finally:
         _cleanup(ctrl)
 
 
 def test_hover_unit_updates_on_unit_switch():
-    """The hover value template carries the display unit and follows a switch."""
-    from bokeh.models import HoverTool
-
+    """The hover value unit (meta_src) follows a unit switch in place."""
     from opensemantic.base.view._channel_utils import (
         get_available_units,
         get_unit_enum,
@@ -322,8 +336,8 @@ def test_hover_unit_updates_on_unit_switch():
         view._unit_selections[group_key] = alt
         view._refresh_plot()
 
-        tips = dict(view.figures[0].select(HoverTool)[0].tooltips)
-        assert by_name[alt] in tips["value"]
+        units = [m.data["unit"][0] for m in view._group_meta.values()]
+        assert by_name[alt] in units
     finally:
         _cleanup(ctrl)
 
@@ -359,13 +373,14 @@ def test_trigger_load_shows_then_hides_spinner():
 
 
 def test_hover_tooltip_renders_in_browser(tmp_path):
-    """Playwright: the exported plot renders with a wired hover tool.
+    """Playwright: hovering the exported plot shows ONE combined tooltip.
 
-    Loads the standalone HTML export (same figures + HoverTool + data as the
-    live plot) in a real browser and inspects the rendered Bokeh document for a
-    HoverTool whose tooltip reports time + value with the display unit. This is
-    deterministic; a pixel-perfect mouse hover over a short line is not. Skips if
-    Playwright or a browser is unavailable.
+    A native multi-series hover renders a separate box per series (they overlap
+    into "one" when same-group values are close); the view builds a single
+    #os-hover-tip with one row per series and marks each series' nearest point.
+    Loads the standalone HTML export in a real browser, hovers the plot and
+    checks the combined tooltip + markers. Skips if Playwright/a browser is
+    unavailable.
     """
     pytest.importorskip("playwright")
     from playwright.sync_api import sync_playwright
@@ -381,31 +396,49 @@ def test_hover_tooltip_renders_in_browser(tmp_path):
                 browser = p.chromium.launch()
             except Exception as exc:  # noqa: BLE001
                 pytest.skip(f"no browser: {exc}")
-            page = browser.new_page()
+            page = browser.new_page(viewport={"width": 1000, "height": 700})
             page.goto(page_file.as_uri(), wait_until="load")
             page.wait_for_selector("canvas", timeout=30000)
             page.wait_for_function(
                 "() => window.Bokeh && Bokeh.documents && Bokeh.documents.length > 0",
                 timeout=30000,
             )
-            # Pull every HoverTool's tooltip spec out of the live Bokeh document.
-            tooltips = page.evaluate(
+            page.wait_for_timeout(400)
+            box = page.query_selector("canvas").bounding_box()
+            cx = box["x"] + box["width"] * 0.5
+            cy = box["y"] + box["height"] * 0.5
+            # Two moves so the global mousemove tracker records a position first.
+            page.mouse.move(cx - 40, cy)
+            page.mouse.move(cx, cy)
+            page.wait_for_timeout(400)
+            tip = page.evaluate(
                 """() => {
-                    const out = [];
-                    for (const doc of Bokeh.documents) {
-                        for (const m of doc._all_models.values()) {
-                            if (m.type === 'HoverTool') out.push(m.tooltips);
-                        }
-                    }
-                    return out;
+                    const t = document.getElementById('os-hover-tip');
+                    if (!t) return {exists: false};
+                    return {exists: true,
+                            visible: t.style.display !== 'none',
+                            rows: t.querySelectorAll('.os-tip-row').length,
+                            text: t.textContent};
+                }"""
+            )
+            markers = page.evaluate(
+                """() => {
+                    for (const doc of Bokeh.documents)
+                      for (const m of doc._all_models.values())
+                        if (m.data && m.data['c'] !== undefined
+                            && m.data['x'] !== undefined && m.data['y'] !== undefined)
+                          return (m.data.x || []).length;
+                    return -1;
                 }"""
             )
             browser.close()
 
-        assert tooltips, "no HoverTool in the rendered Bokeh document"
-        flat = str(tooltips)
-        assert "time" in flat and "value" in flat and "@y" in flat
-        # kelvin symbol carried into the value template.
-        assert "K" in flat
+        assert tip.get("exists") and tip.get("visible"), f"no combined tooltip: {tip}"
+        # One combined box holding one row per series (single series here).
+        assert tip["rows"] >= 1, f"tooltip has no rows: {tip}"
+        # Each series' nearest point is marked.
+        assert markers >= 1, f"no nearest-point marker: {markers}"
+        # kelvin symbol carried into the value row.
+        assert "K" in tip["text"]
     finally:
         _cleanup(ctrl)

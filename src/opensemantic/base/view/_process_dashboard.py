@@ -454,6 +454,7 @@ class ProcessObjectView(BaseDataView):
                 x_axis_label=_pt("rel_time", self.lang),
                 y_axis_label=axis_label,
             )
+            lines, sources, colors, names = [], [], [], []
             for tr in traces:
                 xs, ys = self._extract_trace(tr, gkey)
                 if not xs:
@@ -465,15 +466,33 @@ class ProcessObjectView(BaseDataView):
                 # separate, individually-toggleable legend entries.
                 label = self._trace_label(tr)
                 src = ColumnDataSource(data={"x": xs, "y": ys})
-                fig.line(
+                color = COLORS[color_idx % len(COLORS)]
+                line = fig.line(
                     "x",
                     "y",
                     source=src,
+                    name=label,
                     legend_label=label,
-                    color=COLORS[color_idx % len(COLORS)],
+                    color=color,
                     line_width=2,
                 )
+                lines.append(line)
+                sources.append(src)
+                colors.append(color)
+                names.append(label)
                 color_idx += 1
+            # Shared combined tooltip + per-series markers. The x axis is
+            # relative time (numeric), so format it as a number, not a date.
+            if lines:
+                self._attach_combined_hover(
+                    fig,
+                    lines,
+                    sources,
+                    colors,
+                    names,
+                    self._group_unit_symbol(gkey),
+                    x_kind="number",
+                )
             fig.legend.click_policy = "hide"
             fig.legend.label_text_font_size = "8pt"
             figs.append(fig)

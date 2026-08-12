@@ -24,7 +24,6 @@ from bokeh.models import (
     CustomJS,
     DataRange1d,
     DatetimeTickFormatter,
-    HoverTool,
 )
 from bokeh.plotting import figure as bk_figure
 from panelini import Panelini
@@ -532,18 +531,6 @@ class DataToolView(BaseDataView):
         method = resolve_downsample_method(channel, ds.method.value)
         return ds.max_points, method, ds.edge_anchors
 
-    @staticmethod
-    def _hover_tooltips(unit_symbol):
-        """Hover tooltip rows; the (constant per group) unit is baked in."""
-        value = "@y{0,0.[000000]}"
-        if unit_symbol:
-            value = f"{value} {unit_symbol}"
-        return [
-            ("series", "$name"),
-            ("time", "@x{%Y-%m-%d %H:%M:%S}"),
-            ("value", value),
-        ]
-
     def _display_unit_symbol(self, ch, group_key):
         """Display unit symbol for a group.
 
@@ -600,14 +587,17 @@ class DataToolView(BaseDataView):
                 )
         return traces
 
-    def _make_figures(self, traces=None, source_map=None, group_map=None):
+    def _make_figures(
+        self, traces=None, source_map=None, group_map=None, meta_map=None
+    ):
         """Build one Bokeh figure per group from collected traces.
 
         Returns ``(figs, shared_x_range)``. ``traces`` defaults to a fresh
         extraction, so this doubles as the detached builder for HTML export.
-        When given, ``source_map``/``group_map`` are populated with the
-        per-trace ColumnDataSource and per-group figure so a later refresh can
-        update them in place instead of rebuilding.
+        When given, ``source_map``/``group_map``/``meta_map`` are populated with
+        the per-trace ColumnDataSource, per-group figure and per-group hover
+        unit source so a later refresh can update them in place instead of
+        rebuilding.
         """
         if traces is None:
             traces = self._collect_traces()
@@ -645,11 +635,11 @@ class DataToolView(BaseDataView):
                 hours="%H:%M",
             )
 
-            hover_renderers = []
+            lines, sources, colors, names = [], [], [], []
             for trace_name, timestamps, values in series:
                 src = ColumnDataSource(data={"x": timestamps, "y": values})
                 color = COLORS[color_idx % len(COLORS)]
-                fig.line(
+                line = fig.line(
                     "x",
                     "y",
                     source=src,
@@ -658,45 +648,23 @@ class DataToolView(BaseDataView):
                     color=color,
                     line_width=2,
                 )
-                # Per-point markers, invisible until hovered, so the nearest
-                # data point is highlighted while its tooltip shows. They share
-                # the line's source, so an in-place data update covers both.
-                dots = fig.scatter(
-                    "x",
-                    "y",
-                    source=src,
-                    name=trace_name,
-                    size=8,
-                    marker="circle",
-                    fill_color=color,
-                    line_color=color,
-                    fill_alpha=0,
-                    line_alpha=0,
-                    hover_alpha=1.0,
-                )
-                hover_renderers.append(dots)
+                lines.append(line)
+                sources.append(src)
+                colors.append(color)
+                names.append(trace_name)
                 color_idx += 1
                 if source_map is not None:
                     source_map[(group_key, trace_name)] = src
 
-            # Hover readout: series name, exact timestamp and value, snapped to
-            # the nearest point (which the markers above highlight). vline mode
-            # reports exactly one point per series at the cursor's x - a dense
-            # series would otherwise show several entries under the cursor. The
-            # unit is baked into the template (constant per group) rather than
-            # stored per point; _update_plot_in_place refreshes it on a switch.
-            fig.add_tools(
-                HoverTool(
-                    renderers=hover_renderers,
-                    tooltips=self._hover_tooltips(unit_symbol),
-                    formatters={"@x": "datetime"},
-                    mode="vline",
-                    point_policy="snap_to_data",
-                )
+            # Shared combined tooltip + per-series nearest-point markers.
+            meta_src = self._attach_combined_hover(
+                fig, lines, sources, colors, names, unit_symbol
             )
             fig.legend.click_policy = "hide"
             if group_map is not None:
                 group_map[group_key] = fig
+            if meta_map is not None:
+                meta_map[group_key] = meta_src
             figs.append(fig)
         return figs, shared_x
 
@@ -726,10 +694,12 @@ class DataToolView(BaseDataView):
         self._plot_col.clear()
         source_map: dict = {}
         group_map: dict = {}
-        figs, shared_x = self._make_figures(traces, source_map, group_map)
+        meta_map: dict = {}
+        figs, shared_x = self._make_figures(traces, source_map, group_map, meta_map)
         self._figures = figs
         self._trace_sources = source_map
         self._group_figures = group_map
+        self._group_meta = meta_map
         self._plot_signature = signature if figs else None
         if not figs:
             return
@@ -753,6 +723,7 @@ class DataToolView(BaseDataView):
         """Update existing figures' data and axis labels without new panes."""
         sources = self._trace_sources
         group_figs = getattr(self, "_group_figures", {})
+        group_meta = getattr(self, "_group_meta", {})
         updates = []
         for group_key, _axis_label, _unit, series in traces:
             for trace_name, timestamps, values in series:
@@ -767,9 +738,13 @@ class DataToolView(BaseDataView):
                 fig = group_figs.get(group_key)
                 if fig is not None:
                     fig.yaxis.axis_label = axis_label
-                    # Refresh the hover unit (baked into the template).
-                    for hover in fig.select(HoverTool):
-                        hover.tooltips = self._hover_tooltips(unit_symbol)
+                # Refresh the hover unit (read by _HOVER_JS from meta_src),
+                # preserving the x-kind column.
+                meta_src = group_meta.get(group_key)
+                if meta_src is not None:
+                    data = dict(meta_src.data)
+                    data["unit"] = [unit_symbol or ""]
+                    meta_src.data = data
             # The shared x-range is left untouched: an auto range (never zoomed)
             # re-follows the new data on the CDS update, and a prior box-zoom is
             # intentionally preserved so "Load current range" keeps the window.

@@ -21,6 +21,8 @@ import logging
 from typing import Any, List, Tuple
 
 import panel as pn
+from bokeh.events import MouseLeave
+from bokeh.models import ColumnDataSource, CustomJS, HoverTool
 from bokeh.palettes import Category10_10
 
 from opensemantic.base.view._channel_utils import (
@@ -44,6 +46,89 @@ COLORS = Category10_10
 
 # Row cap for data export (uniform np.linspace downsampling above this).
 EXPORT_MAX_ROWS = 1_000_000
+
+# Shared-crosshair hover (see _attach_combined_hover): a HoverTool (vline, no
+# native tooltip) runs this on every move. It finds the nearest point per
+# series, marks them in ``hl`` (one row per series) and fills a single floating
+# tooltip with one row per series - a native multi-series hover renders a
+# separate box per series, which overlap into "one" when same-group channels
+# share similar values. The unit comes from ``meta`` so a unit switch refreshes
+# it in place. Timestamps are formatted in UTC to match the datetime axis.
+_HOVER_JS = r"""
+if (!window.__osHoverInit) {
+  window.__osHoverMouse = {x: 0, y: 0};
+  window.addEventListener('mousemove', function (e) {
+    window.__osHoverMouse = {x: e.clientX, y: e.clientY};
+  }, true);
+  window.__osHoverInit = true;
+}
+let tip = document.getElementById('os-hover-tip');
+const g = cb_data.geometry;
+if (g == null || g.x == null) { if (tip) { tip.style.display = 'none'; } return; }
+const hx = g.x;
+const unit = (meta.data.unit && meta.data.unit[0]) || '';
+const xkind = (meta.data.xkind && meta.data.xkind[0]) || 'datetime';
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+  });
+}
+function pad(n) { return String(n).padStart(2, '0'); }
+function fmtx(v) {
+  if (xkind === 'datetime') {
+    const d = new Date(v);
+    const day = d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) +
+                '-' + pad(d.getUTCDate());
+    const tod = pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) +
+                ':' + pad(d.getUTCSeconds());
+    return day + ' ' + tod;
+  }
+  return Number(v).toLocaleString(undefined, {maximumFractionDigits: 3});
+}
+const xs = [], ys = [], cs = [];
+let rows = '';
+for (let s = 0; s < sources.length; s++) {
+  const data = sources[s].data;
+  const X = data['x'], Y = data['y'];
+  if (!X || X.length === 0) { continue; }
+  let best = 0, bestd = Infinity;
+  for (let i = 0; i < X.length; i++) {
+    const d = Math.abs(X[i] - hx);
+    if (d < bestd) { bestd = d; best = i; }
+  }
+  xs.push(X[best]); ys.push(Y[best]); cs.push(colors[s]);
+  const val = Number(Y[best]).toLocaleString(undefined, {maximumFractionDigits: 6});
+  rows += '<div class="os-tip-row" style="white-space:nowrap">' +
+          '<span style="color:' + colors[s] + '">●</span> ' +
+          esc(names[s]) + ': <b>' + val + (unit ? ' ' + esc(unit) : '') + '</b>' +
+          ' <span style="opacity:.6">' + fmtx(X[best]) + '</span></div>';
+}
+hl.data = {x: xs, y: ys, c: cs};
+hl.change.emit();
+if (rows === '') { if (tip) { tip.style.display = 'none'; } return; }
+if (!tip) {
+  tip = document.createElement('div');
+  tip.id = 'os-hover-tip';
+  tip.style.cssText =
+    'position:fixed;z-index:10000;background:rgba(255,255,255,0.96);' +
+    'border:1px solid #bbb;border-radius:3px;padding:4px 8px;font:12px sans-serif;' +
+    'color:#222;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,0.2);';
+  document.body.appendChild(tip);
+}
+tip.innerHTML = rows;
+tip.style.display = 'block';
+const m = window.__osHoverMouse;
+tip.style.left = (m.x + 14) + 'px';
+tip.style.top = (m.y + 14) + 'px';
+"""
+
+# Clear the marker and hide the floating tooltip when the pointer leaves a plot.
+_HOVER_LEAVE_JS = r"""
+hl.data = {x: [], y: [], c: []};
+hl.change.emit();
+const tip = document.getElementById('os-hover-tip');
+if (tip) { tip.style.display = 'none'; }
+"""
 
 # Optional dependencies for unit-aware data export (opensemantic.base[export]).
 try:
@@ -730,19 +815,18 @@ class BaseDataView:
         except Exception:
             return "dimensionless"
 
-    def _get_axis_label(self, group_key: str) -> str:
-        """Build y-axis label: characteristic name [unit symbol]."""
+    def _group_unit_symbol(self, group_key: str) -> str:
+        """Display unit symbol for a group (e.g. ``K``), or ``""`` if none."""
         channels = self._groups.get(group_key, [])
         if not channels:
             return ""
         sample_ch = channels[0][1]
-        char_label = resolve_characteristic_label(sample_ch, self.lang)
 
         unit_name = self._unit_selections.get(group_key)
         if unit_name:
             for u in get_available_units(sample_ch):
                 if u["name"] == unit_name:
-                    return f"{char_label} [{u['symbol']}]"
+                    return u["symbol"]
 
         ch_unit = getattr(sample_ch, "unit", None)
         if ch_unit:
@@ -752,10 +836,61 @@ class BaseDataView:
             if unit_enum:
                 for member in unit_enum:
                     if member.value == ch_unit or member.name == ch_unit:
-                        symbol = symbol_map.get(member.name, member.name)
-                        return f"{char_label} [{symbol}]"
+                        return symbol_map.get(member.name, member.name)
 
-        return char_label
+        return ""
+
+    def _get_axis_label(self, group_key: str) -> str:
+        """Build y-axis label: characteristic name [unit symbol]."""
+        channels = self._groups.get(group_key, [])
+        if not channels:
+            return ""
+        char_label = resolve_characteristic_label(channels[0][1], self.lang)
+        symbol = self._group_unit_symbol(group_key)
+        return f"{char_label} [{symbol}]" if symbol else char_label
+
+    def _attach_combined_hover(
+        self, fig, lines, sources, colors, names, unit_symbol="", x_kind="datetime"
+    ):
+        """Attach the shared-crosshair hover to ``fig`` (see _HOVER_JS).
+
+        One combined tooltip with a row per series and one nearest-point marker
+        per series. ``lines``/``sources``/``colors``/``names`` are per-series and
+        aligned. ``x_kind`` is ``"datetime"`` (x formatted as a UTC timestamp) or
+        ``"number"`` (e.g. relative time). Returns the ``meta`` ColumnDataSource
+        carrying the group's unit symbol and x-kind, so a caller can refresh the
+        unit in place on a unit switch.
+        """
+        hl_src = ColumnDataSource(data={"x": [], "y": [], "c": []})
+        # Drawn after the lines so the highlighted points sit on top.
+        fig.scatter(
+            "x",
+            "y",
+            source=hl_src,
+            size=9,
+            marker="circle",
+            fill_color="c",
+            line_color="c",
+            fill_alpha=1.0,
+            line_alpha=1.0,
+        )
+        meta_src = ColumnDataSource(
+            data={"unit": [unit_symbol or ""], "xkind": [x_kind]}
+        )
+        hover = HoverTool(renderers=list(lines), mode="vline", tooltips=None)
+        hover.callback = CustomJS(
+            args={
+                "hl": hl_src,
+                "meta": meta_src,
+                "sources": list(sources),
+                "colors": list(colors),
+                "names": list(names),
+            },
+            code=_HOVER_JS,
+        )
+        fig.add_tools(hover)
+        fig.js_on_event(MouseLeave, CustomJS(args={"hl": hl_src}, code=_HOVER_LEAVE_JS))
+        return meta_src
 
     # -- Data loading entry point (async-context aware) --
 
