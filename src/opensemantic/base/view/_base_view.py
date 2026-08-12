@@ -680,6 +680,16 @@ class BaseDataView:
         self._build_figure()
         self._update_log_console()
         self._update_export_state()
+        self._set_plot_loading(False)
+
+    def _set_plot_loading(self, flag):
+        """Toggle the plot column's loading spinner (safe if not yet built)."""
+        col = getattr(self, "_plot_col", None)
+        if col is not None:
+            try:
+                col.loading = bool(flag)
+            except Exception:  # noqa: BLE001 - loading is cosmetic
+                pass
 
     def _numeric(self, value: Any, channel: Any, target_unit_name: Any) -> Any:
         """Convert a value to its display unit and return the numeric scalar.
@@ -751,6 +761,10 @@ class BaseDataView:
 
     def _trigger_load(self):
         """Start data loading, handling sync vs running-loop contexts."""
+        # Show the spinner synchronously so it is visible even for the initial
+        # load kicked off during page build (e.g. a URL-restored selection),
+        # not only once the async task starts. _refresh_plot clears it.
+        self._set_plot_loading(True)
         try:
             asyncio.get_running_loop()
             asyncio.ensure_future(self._load_and_plot())

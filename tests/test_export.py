@@ -340,13 +340,17 @@ def test_set_plot_loading_toggles_spinner():
         _cleanup(ctrl)
 
 
-def test_load_and_plot_wraps_with_loading():
-    """_load_and_plot turns the spinner on for the fetch and off at the end."""
+def test_trigger_load_shows_then_hides_spinner():
+    """_trigger_load turns the spinner on synchronously; the load clears it.
+
+    Set synchronously (not inside the async task) so the initial URL-restored
+    load shows it before the pane renders.
+    """
     view, ctrl = _loaded_view()
     try:
         calls = []
         view._set_plot_loading = lambda flag: calls.append(bool(flag))
-        asyncio.run(view._load_and_plot())
+        view._trigger_load()  # no running loop -> runs the load synchronously
         assert calls, "loading was never toggled"
         assert calls[0] is True
         assert calls[-1] is False

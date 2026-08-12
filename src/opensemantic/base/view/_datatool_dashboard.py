@@ -476,7 +476,6 @@ class DataToolView(BaseDataView):
 
         limit = self._config.plot.row_limit
         self._cached_data.clear()
-        self._set_plot_loading(True)
 
         # Load data for each channel. For composite sub-channels, load the parent.
         loaded_parents = set()
@@ -517,10 +516,7 @@ class DataToolView(BaseDataView):
             except Exception as e:
                 _logger.error("Error loading %s/%s: %s", ctrl.name, ch.name, e)
 
-        try:
-            self._refresh_plot()
-        finally:
-            self._set_plot_loading(False)
+        self._refresh_plot()
 
     def _downsample_for(self, channel):
         """Return ``(max_points, method, edge_anchors)`` for a channel.
@@ -684,15 +680,17 @@ class DataToolView(BaseDataView):
                     source_map[(group_key, trace_name)] = src
 
             # Hover readout: series name, exact timestamp and value, snapped to
-            # the nearest point (which the markers above highlight). The unit is
-            # baked into the template (constant per group) rather than stored per
-            # point; _update_plot_in_place refreshes it on a unit switch.
+            # the nearest point (which the markers above highlight). vline mode
+            # reports exactly one point per series at the cursor's x - a dense
+            # series would otherwise show several entries under the cursor. The
+            # unit is baked into the template (constant per group) rather than
+            # stored per point; _update_plot_in_place refreshes it on a switch.
             fig.add_tools(
                 HoverTool(
                     renderers=hover_renderers,
                     tooltips=self._hover_tooltips(unit_symbol),
                     formatters={"@x": "datetime"},
-                    mode="mouse",
+                    mode="vline",
                     point_policy="snap_to_data",
                 )
             )
@@ -777,15 +775,6 @@ class DataToolView(BaseDataView):
             # intentionally preserved so "Load current range" keeps the window.
 
         self._schedule_doc(_apply)
-
-    def _set_plot_loading(self, flag):
-        """Toggle the plot column's loading spinner (safe if not yet built)."""
-        col = getattr(self, "_plot_col", None)
-        if col is not None:
-            try:
-                col.loading = bool(flag)
-            except Exception:
-                pass
 
     def _schedule_doc(self, fn):
         """Run a Bokeh-model mutation on the document thread when live.
