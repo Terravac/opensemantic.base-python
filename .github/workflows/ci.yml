@@ -105,7 +105,8 @@ jobs:
 
   publish:
     needs: finalize
-    if: ${{ contains(github.ref, 'refs/tags/') }}
+    # this fork is not released to PyPI
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
