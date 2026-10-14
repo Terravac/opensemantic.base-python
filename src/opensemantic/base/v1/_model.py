@@ -3183,6 +3183,24 @@ class Status(str, Enum):
     """
     Done
     """
+    Item_OSWbf87b0400b2c44e8991e2489f5516c2f = (
+        "Item:OSWbf87b0400b2c44e8991e2489f5516c2f"
+    )
+    """
+    Failed
+    """
+    Item_OSWc6960f29ecc74a0681e746a3cc31fa6f = (
+        "Item:OSWc6960f29ecc74a0681e746a3cc31fa6f"
+    )
+    """
+    Awaiting evaluation
+    """
+    Item_OSW844296696d9e4fa597f03213365d5dda = (
+        "Item:OSW844296696d9e4fa597f03213365d5dda"
+    )
+    """
+    Warning
+    """
 
 
 class HasComment(OswBaseModel):
@@ -3909,8 +3927,24 @@ class Process(Item):
             "_autocomplete": {
                 "category": "Category:OSW9725d7a91bab4f1aa68f423e4e9bfcf4"
             },
-            "enum_titles": ["To do", "In work", "Done"],
-            "enum_titles*": {"de": ["Zu tun", "In Arbeit", "Erledigt"]},
+            "enum_titles": [
+                "To do",
+                "In work",
+                "Done",
+                "Failed",
+                "Awaiting evaluation",
+                "Warning",
+            ],
+            "enum_titles*": {
+                "de": [
+                    "Zu tun",
+                    "In Arbeit",
+                    "Erledigt",
+                    "Fehlgeschlagen",
+                    "Wartet auf Auswertung",
+                    "Warnung",
+                ]
+            },
             "grid_columns": 6,
         },
         title="Status",
