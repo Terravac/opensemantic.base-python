@@ -4294,14 +4294,11 @@ class Process(Item):
                 "de": "Beschreibender Kommentar, der für Messparametern, Probenbezeichnungen, Abweichungen vom Standardprozess, etc. verwendet wird"
             },
         },
-        title="comment",
     )
     """
     Beschreibender Kommentar, der für Messparametern, Probenbezeichnungen, Abweichungen vom Standardprozess, etc. verwendet wird
     """
-    jobid: Any | None = Field(
-        None, json_schema_extra={"title*": {"de": "Auftrags-ID"}}, title="jobid"
-    )
+    jobid: Any | None = Field(None, json_schema_extra={"title*": {"de": "Auftrags-ID"}})
     creator: Person | None = Field(
         None,
         json_schema_extra={

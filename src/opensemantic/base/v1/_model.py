@@ -3857,13 +3857,12 @@ class Process(Item):
         description_={
             "de": "Beschreibender Kommentar, der für Messparametern, Probenbezeichnungen, Abweichungen vom Standardprozess, etc. verwendet wird"
         },
-        title="comment",
         title_={"de": "Messkommentar"},
     )
     """
     Beschreibender Kommentar, der für Messparametern, Probenbezeichnungen, Abweichungen vom Standardprozess, etc. verwendet wird
     """
-    jobid: Any | None = Field(None, title="jobid", title_={"de": "Auftrags-ID"})
+    jobid: Any | None = Field(None, title_={"de": "Auftrags-ID"})
     creator: Person | None = Field(
         None,
         range="Category:OSW44deaa5b806d41a2a88594f562b110e9",
